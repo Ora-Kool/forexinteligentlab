@@ -1,0 +1,3 @@
+# Optional macOS dependencies for MT5_MODE=bridge (Wine MetaTrader 5.app).
+# Do NOT install these on Windows — use the native MetaTrader5 package there.
+mt5-mac-bridge[bridge]>=0.1.0
