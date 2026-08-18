@@ -4,12 +4,12 @@ Thank you for helping. This project is a **research desk** for FBS / MetaTrader 
 
 The product spans **two repositories**:
 
-| Repo | Role |
-|---|---|
-| `forexinteligentlab` (this repo) | FastAPI, MT5 adapters, collector, ML, PostgreSQL, ops scripts |
-| `forextradingai` | Laravel + Vue desk UI (Herd), auth, workspaces, API proxy |
+| Repo | GitHub | Role |
+|---|---|---|
+| Backend (this repo) | https://github.com/Ora-Kool/forex-trading-lab-dashboard.git | FastAPI, MT5 adapters, collector, ML, PostgreSQL, ops scripts |
+| Desk UI | https://github.com/Ora-Kool/forex-trading-ai-server.git | Laravel + Vue desk UI (Herd), auth, workspaces, API proxy |
 
-PRs that change the desk UI usually live in `forextradingai`. PRs that change market data, models, or MT5 live here. Cross-cutting changes need **two PRs** (or one PR per repo) linked in the descriptions.
+PRs that change the desk UI usually live in `forex-trading-ai-server`. PRs that change market data, models, or MT5 live here. Cross-cutting changes need **two PRs** (or one PR per repo) linked in the descriptions.
 
 ---
 
@@ -115,8 +115,8 @@ createdb forex_intelligence
 ### A.1 Clone and Python env
 
 ```bash
-git clone <this-repo-url> forexinteligentlab
-cd forexinteligentlab
+git clone https://github.com/Ora-Kool/forex-trading-lab-dashboard.git
+cd forex-trading-lab-dashboard
 cp .env.example .env
 python3 -m venv .venv
 source .venv/bin/activate
@@ -203,8 +203,8 @@ Then start the desk (section 10).
 ### B.2 Backend
 
 ```bat
-git clone <this-repo-url> forexinteligentlab
-cd forexinteligentlab
+git clone https://github.com/Ora-Kool/forex-trading-lab-dashboard.git
+cd forex-trading-lab-dashboard
 copy .env.example .env
 python -m venv .venv
 .venv\Scripts\activate
@@ -283,8 +283,8 @@ Synthetic majors are seeded for local dashboard work. Do not treat mock prices a
 Clone next to the lab (paths may differ on your machine):
 
 ```bash
-git clone <forextradingai-url> forextradingai
-cd forextradingai
+git clone https://github.com/Ora-Kool/forex-trading-ai-server.git
+cd forex-trading-ai-server
 cp .env.example .env   # if present
 ```
 

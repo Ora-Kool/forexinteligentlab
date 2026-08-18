@@ -4,6 +4,17 @@ Research desk for collecting FBS / MetaTrader 5 market data, computing features,
 
 **This system does not place orders, deposits, or withdrawals.** Predictions are not trading recommendations. Historical simulations do not guarantee future results.
 
+## Repository
+
+```bash
+git clone https://github.com/Ora-Kool/forex-trading-lab-dashboard.git
+cd forex-trading-lab-dashboard
+```
+
+GitHub: [Ora-Kool/forex-trading-lab-dashboard](https://github.com/Ora-Kool/forex-trading-lab-dashboard)
+
+Companion desk UI (Laravel): [Ora-Kool/forex-trading-lab-dashboard](https://github.com/Ora-Kool/forex-trading-lab-dashboard)
+
 ---
 
 ## Start here (contributors)
@@ -22,10 +33,10 @@ Mac Wine bridge details: **[docs/MT5_MAC_BRIDGE.md](docs/MT5_MAC_BRIDGE.md)**
 
 ## Two repositories
 
-| Repository | Responsibility |
-|---|---|
-| **This repo (`forexinteligentlab`)** | FastAPI, PostgreSQL, MT5 adapters, collector, ML |
-| **`forextradingai`** | Laravel + Vue desk, auth, workspaces, `/api` proxy to FastAPI |
+| Repository                                                                                              | Responsibility |
+|---------------------------------------------------------------------------------------------------------|---|
+| **[forexinteligentlab](https://github.com/Ora-Kool/forexinteligentlab)** (this repo) | FastAPI, PostgreSQL, MT5 adapters, collector, ML |
+| **[forex-trading-lab-dashboard](https://github.com/Ora-Kool/forex-trading-lab-dashboard)**                                | Laravel + Vue desk, auth, workspaces, `/api` proxy to FastAPI |
 
 ---
 
@@ -53,7 +64,8 @@ FBS account
 ### macOS + live FBS (recommended)
 
 ```bash
-cd forexinteligentlab
+git clone https://github.com/Ora-Kool/forex-trading-lab-dashboard.git
+cd forex-trading-lab-dashboard
 cp .env.example .env          # set MT5_MODE=bridge and credentials
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r backend/requirements.txt -r backend/requirements-bridge.txt
@@ -69,7 +81,7 @@ psql -d forex_intelligence -f database/migrations/001_init.sql
 ./scripts/lab.sh status
 ```
 
-Desk: clone/run `forextradingai`, then open [http://forextradingai.test](http://forextradingai.test).  
+Desk: clone [forex-trading-ai-server](https://github.com/Ora-Kool/forex-trading-ai-server), then open [http://forextradingai.test](http://forextradingai.test).  
 Full steps → [CONTRIBUTING.md](CONTRIBUTING.md#6-path-a--macos-with-metatrader-5app-recommended-for-live-fbs-on-mac).
 
 ### Windows + live FBS
