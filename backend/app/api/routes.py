@@ -1,11 +1,12 @@
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.constants import FEATURE_COLUMNS, RESEARCH_DISCLAIMER, TIMEFRAMES, pip_size_for
+from app.core.constants import FEATURE_COLUMNS, RESEARCH_DISCLAIMER, TIMEFRAMES, pip_size_for, spread_pips
 from app.core.security import create_access_token, verify_password
 from app.core.tenant import SYSTEM_WORKSPACE_ID, current_workspace_id, own, research_ids, visible
 from app.database.session import get_db
@@ -19,6 +20,7 @@ from app.models.event import SystemEvent
 from app.models.feature import FeatureRow
 from app.models.instrument import MonitoredInstrument, Symbol
 from app.models.prediction import ModelPrediction, ModelVersion
+from app.models.research import ResearchExperiment, ResearchFold
 from app.mt5.base import CandleRecord
 from app.mt5.factory import get_connector
 from app.schemas.common import (
@@ -30,16 +32,27 @@ from app.schemas.common import (
     ImportRequest,
     LoginRequest,
     MonitorIn,
+    ResearchExperimentRequest,
     SymbolOut,
     TokenResponse,
     TrainRequest,
 )
+from app.research.config import ResearchConfig
+from app.research.service import create_and_run_experiment
 from app.api.deps import Principal, TenantRouter, current_username, require_agent_key, require_saas_key
+from app.services.backfill import ensure_history_for_training
 from app.services.candles import load_candles, upsert_candles
 from app.services.events import record_event
 from app.services.features import persist_latest_features
 from app.services.importer import import_history
-from app.services.predictions import generate_prediction
+from app.services.predictions import (
+    delete_model_version,
+    generate_prediction,
+    market_coverage,
+    prune_inactive_models,
+    research_pips,
+    summarize_predictions,
+)
 from app.services.quality import latest_timestamp, quality_report
 from app.services.runtime import runtime
 from app.services.symbols import bootstrap_workspace_monitor, ensure_default_monitor, persist_discovered
@@ -223,7 +236,35 @@ def get_predictions(
     if end:
         query = query.filter(ModelPrediction.timestamp <= end)
     rows = query.order_by(ModelPrediction.timestamp.desc()).limit(limit).all()
-    return rows
+    return [{**jsonable_encoder(row), "pips": research_pips(row)} for row in rows]
+
+
+@router.get("/api/predictions/summary", tags=["models"])
+def get_predictions_summary(
+    symbol: str | None = None,
+    timeframe: str | None = None,
+    model_version: str | None = None,
+    start: datetime | None = None,
+    end: datetime | None = None,
+    db: Session = Depends(get_db),
+    _: str = Depends(current_username),
+):
+    query = visible(db.query(ModelPrediction), ModelPrediction)
+    if symbol:
+        query = query.filter(ModelPrediction.symbol == symbol)
+    if timeframe:
+        query = query.filter(ModelPrediction.timeframe == timeframe)
+    if model_version:
+        query = query.filter(ModelPrediction.model_version == model_version)
+    if start:
+        query = query.filter(ModelPrediction.timestamp >= start)
+    if end:
+        query = query.filter(ModelPrediction.timestamp <= end)
+    settings = get_settings()
+    cost = float(settings.spread_cost_pips) + float(settings.transaction_cost_pips)
+    payload = summarize_predictions(query.all(), cost)
+    payload["market"] = market_coverage(db)
+    return payload
 
 
 @router.get("/api/models", tags=["models"])
@@ -231,9 +272,40 @@ def get_models(db: Session = Depends(get_db), _: str = Depends(current_username)
     return visible(db.query(ModelVersion), ModelVersion).order_by(ModelVersion.created_at.desc()).all()
 
 
+@router.delete("/api/models/inactive", tags=["models"])
+def delete_inactive_models(db: Session = Depends(get_db), _: str = Depends(current_username)):
+    result = prune_inactive_models(db)
+    record_event(db, "info", "training", f"Deleted {result['deleted']} inactive model versions")
+    return result
+
+
+@router.delete("/api/models/{model_id}", tags=["models"])
+def delete_model(model_id: int, db: Session = Depends(get_db), _: str = Depends(current_username)):
+    result = delete_model_version(db, model_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail="Model not found in this workspace")
+    record_event(
+        db,
+        "info",
+        "training",
+        f"Deleted {result['symbol']} {result['timeframe']} {result['version']}",
+    )
+    return result
+
+
 @router.post("/api/models/train", tags=["models"])
 def train_model(payload: TrainRequest, db: Session = Depends(get_db), _: str = Depends(current_username)):
     settings = get_settings()
+
+    # A timeframe the collector never polled has no candles yet. Pull it from the
+    # active MT5 adapter on demand so training a new timeframe is one click.
+    backfill: dict | None = None
+    try:
+        backfill = ensure_history_for_training(db, get_connector(), payload.symbol, payload.timeframe)
+    except Exception as exc:
+        db.rollback()
+        record_event(db, "warning", "backfill", f"On-demand import failed for {payload.symbol} {payload.timeframe}: {exc}")
+
     query = db.query(MarketCandle).filter(MarketCandle.symbol == payload.symbol, MarketCandle.timeframe == payload.timeframe)
     if payload.start:
         query = query.filter(MarketCandle.timestamp >= payload.start)
@@ -262,7 +334,10 @@ def train_model(payload: TrainRequest, db: Session = Depends(get_db), _: str = D
             pip_size=pip_size_for(payload.symbol),
         )
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
+        detail = str(exc)
+        if backfill and backfill.get("error"):
+            detail = f"{detail} Live import reported: {backfill['error']}"
+        raise HTTPException(status_code=400, detail=detail)
     own(db.query(ModelVersion), ModelVersion).filter(
         ModelVersion.symbol == payload.symbol,
         ModelVersion.timeframe == payload.timeframe,
@@ -294,6 +369,7 @@ def train_model(payload: TrainRequest, db: Session = Depends(get_db), _: str = D
     db.commit()
     record_event(db, "info", "training", f"Trained {payload.symbol} {payload.timeframe} {result['version']}")
     generate_prediction(db, payload.symbol, payload.timeframe)
+    result["backfill"] = backfill
     return result
 
 
@@ -414,6 +490,85 @@ def backtest(payload: BacktestRequest, db: Session = Depends(get_db), _: str = D
         raise HTTPException(status_code=400, detail=str(exc))
 
 
+@router.get("/api/research/experiments", tags=["research"])
+def list_research_experiments(
+    limit: int = Query(default=50, ge=1, le=200),
+    db: Session = Depends(get_db),
+    _: str = Depends(current_username),
+):
+    return (
+        own(db.query(ResearchExperiment), ResearchExperiment)
+        .order_by(ResearchExperiment.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+
+@router.get("/api/research/experiments/{experiment_id}", tags=["research"])
+def get_research_experiment(
+    experiment_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(current_username),
+):
+    experiment = (
+        own(db.query(ResearchExperiment), ResearchExperiment)
+        .filter(ResearchExperiment.id == experiment_id)
+        .one_or_none()
+    )
+    if experiment is None:
+        raise HTTPException(status_code=404, detail="Research experiment not found")
+    folds = (
+        db.query(ResearchFold)
+        .filter(ResearchFold.experiment_id == experiment.id)
+        .order_by(ResearchFold.fold_index.asc())
+        .all()
+    )
+    return {**jsonable_encoder(experiment), "folds": jsonable_encoder(folds)}
+
+
+@router.post("/api/research/experiments", tags=["research"])
+def run_research_experiment(
+    payload: ResearchExperimentRequest,
+    db: Session = Depends(get_db),
+    _: str = Depends(current_username),
+):
+    settings = get_settings()
+    config = ResearchConfig(
+        tp_atr=payload.tp_atr,
+        sl_atr=payload.sl_atr,
+        timeout_bars=payload.timeout_bars,
+        spread_cost_pips=float(settings.spread_cost_pips),
+        transaction_cost_pips=float(settings.transaction_cost_pips),
+        minimum_edge_pips=payload.minimum_edge_pips,
+        ambiguity_policy=payload.ambiguity_policy,
+        folds=payload.folds,
+        min_train_bars=payload.min_train_bars,
+        validation_bars=payload.validation_bars,
+        minimum_tuning_signals=payload.minimum_tuning_signals,
+        minimum_validation_signals=payload.minimum_validation_signals,
+        thresholds=tuple(sorted(set(payload.thresholds))),
+        bootstrap_samples=payload.bootstrap_samples,
+    )
+    try:
+        experiment = create_and_run_experiment(
+            db,
+            symbol=payload.symbol.upper(),
+            timeframe=payload.timeframe,
+            config=config,
+            strategy_name=payload.strategy_name,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    record_event(
+        db,
+        "info",
+        "research",
+        f"Research experiment {experiment.code}: {experiment.status}",
+        {"experiment_id": experiment.id, "metrics": experiment.metrics},
+    )
+    return get_research_experiment(experiment.id, db, _)
+
+
 @router.get("/api/dashboard", tags=["market"])
 def dashboard(db: Session = Depends(get_db), _: str = Depends(current_username)):
     instruments = [item for item in bootstrap_workspace_monitor(db) if item.enabled]
@@ -465,7 +620,7 @@ def dashboard(db: Session = Depends(get_db), _: str = Depends(current_username))
                 "trend": trend,
                 "change_pct": change_pct,
                 "spread": latest.spread if latest else None,
-                "spread_pips": (latest.spread / pip_size_for(item.symbol)) if latest and latest.spread else None,
+                "spread_pips": spread_pips(latest.spread, item.symbol) if latest else None,
                 "timestamp": latest.timestamp if latest else None,
                 "status": status.status if status else "IDLE",
                 "probability_up": pred.probability_up if pred else None,

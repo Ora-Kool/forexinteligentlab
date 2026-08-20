@@ -71,6 +71,32 @@ MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
 3. Auto-backfill fills `SEED_HISTORY_DAYS` (default 30) for thin instruments
 4. Models → Train → Predictions (Entry / Exit / Δ) → Backtest
 
+Training a timeframe the collector never polled (H1, H4, D1) imports its history
+on demand first, so no manual import step is needed. The window widens with the
+timeframe — 30 days of H4 is only ~130 bars, below the trainer's 80-labeled-bar
+floor — so the first H4/D1 train takes a few extra seconds. The collector still
+only polls the timeframes you enable in the monitor, so enable H4 there if you
+want fresh H4 predictions to keep arriving after training. Enabling a pair in any
+workspace is enough — the collector polls the union across workspaces and scores
+each owner's model separately.
+
+## Broker server clock
+
+MetaTrader reports bar times on the *broker server* clock, not UTC. FBS runs
+EET/EEST, so bars arrive +2h (winter) or +3h (summer) ahead. The adapter detects
+the offset from a live tick on connect and converts to real UTC; look for
+`mt5_server_offset_detected` in `.run/logs/backend.log` to confirm.
+
+Auto-detection needs a live tick, so if you start the stack while the market is
+closed the offset cannot be measured and falls back to zero. Pin it instead:
+
+```bash
+MT5_SERVER_UTC_OFFSET_MINUTES=180   # FBS summer (EEST); use 120 in winter
+```
+
+Getting this wrong shifts `hour_of_day` and the session flags, which silently
+mislabels the features your models train on.
+
 ## Health checks
 
 ```bash

@@ -27,7 +27,12 @@ def train_logistic_regression(
 ) -> dict:
     table = build_training_table(candles)
     if len(table) < 80:
-        raise ValueError("Not enough labeled samples to train (need at least 80 after feature warmup).")
+        raise ValueError(
+            f"Not enough {timeframe} history for {symbol}: {len(candles)} candles gave "
+            f"{len(table)} labeled bars, need at least 80 after feature warmup. "
+            f"Import more {timeframe} history from Settings, or enable {symbol} {timeframe} "
+            "in the monitor so auto-backfill can fill it."
+        )
 
     train, test = chronological_split(table, test_ratio=0.2)
     if train.empty or test.empty:

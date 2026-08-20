@@ -5,6 +5,7 @@ from app.models.event import SystemEvent
 from app.models.feature import FeatureRow
 from app.models.instrument import MonitoredInstrument, Symbol
 from app.models.prediction import ModelPrediction, ModelVersion
+from app.models.research import ResearchExperiment, ResearchFold
 from app.models.user import User
 
 __all__ = [
@@ -16,6 +17,8 @@ __all__ = [
     "ModelPrediction",
     "ModelVersion",
     "MonitoredInstrument",
+    "ResearchExperiment",
+    "ResearchFold",
     "Symbol",
     "SystemEvent",
     "User",

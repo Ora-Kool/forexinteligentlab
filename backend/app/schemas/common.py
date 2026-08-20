@@ -99,6 +99,28 @@ class BacktestRequest(BaseModel):
     model_version: str | None = None
 
 
+class ResearchExperimentRequest(BaseModel):
+    symbol: str
+    timeframe: str = Field(pattern="^(M1|M5|M15|M30|H1|H4|D1)$")
+    strategy_name: str = Field(default="Triple barrier logistic", min_length=3, max_length=120)
+    tp_atr: float = Field(default=1.5, gt=0, le=10)
+    sl_atr: float = Field(default=1.0, gt=0, le=10)
+    timeout_bars: int = Field(default=12, ge=1, le=500)
+    minimum_edge_pips: float = Field(default=0.5, ge=0, le=1000)
+    ambiguity_policy: str = Field(default="pessimistic", pattern="^(pessimistic|exclude)$")
+    folds: int = Field(default=4, ge=1, le=12)
+    min_train_bars: int = Field(default=1000, ge=100, le=100000)
+    validation_bars: int = Field(default=500, ge=50, le=50000)
+    minimum_tuning_signals: int = Field(default=30, ge=5, le=10000)
+    minimum_validation_signals: int = Field(default=50, ge=5, le=10000)
+    thresholds: list[float] = Field(
+        default_factory=lambda: [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85],
+        min_length=1,
+        max_length=20,
+    )
+    bootstrap_samples: int = Field(default=1000, ge=100, le=10000)
+
+
 class AgentCandleIn(BaseModel):
     symbol: str
     timeframe: str

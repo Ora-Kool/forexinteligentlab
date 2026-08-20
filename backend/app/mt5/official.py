@@ -6,11 +6,22 @@ symbol lists, ticks, and historical/realtime candles.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from app.core.config import get_settings
 from app.core.constants import SYMBOL_SUFFIXES, TIMEFRAME_MT5
+from app.core.logging import get_logger
 from app.mt5.base import CandleRecord, MT5Connector, MT5Status, SymbolInfo, TickRecord
+
+log = get_logger(__name__)
+
+# MetaTrader reports candle/tick times as epoch seconds built from the *broker
+# server* wall clock, not UTC. Treating them as UTC shifts every bar by the
+# server offset (FBS runs EET/EEST, so +2h or +3h), which corrupts hour_of_day
+# and the session flags. Detect the offset from a live tick and correct it.
+OFFSET_PROBE_SYMBOLS = ("EURUSD", "GBPUSD", "USDJPY", "XAUUSD")
+MAX_PLAUSIBLE_OFFSET_MINUTES = 14 * 60
+OFFSET_ROUNDING_MINUTES = 15
 
 
 def _import_mt5():
@@ -26,9 +37,15 @@ def _import_mt5():
 
 
 def _as_utc(value) -> datetime:
+    """Read a raw MT5 time as an aware datetime, still on the server clock."""
     if isinstance(value, datetime):
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
     return datetime.fromtimestamp(int(value), tz=UTC)
+
+
+def _round_offset_minutes(seconds: float) -> int:
+    minutes = seconds / 60
+    return int(round(minutes / OFFSET_ROUNDING_MINUTES) * OFFSET_ROUNDING_MINUTES)
 
 
 def _base_code(name: str) -> str:
@@ -41,6 +58,47 @@ class OfficialMT5Connector(MT5Connector):
         self._connected = False
         self._error = ""
         self._status = MT5Status(connected=False, mode="official")
+        self._server_offset: timedelta | None = None
+        self._point_cache: dict[str, float] = {}
+
+    def _detect_server_offset(self) -> timedelta:
+        """Server clock minus UTC, from the freshest tick we can find.
+
+        A configured ``MT5_SERVER_UTC_OFFSET_MINUTES`` always wins. Auto-detection
+        needs a live tick, so outside market hours the newest tick is stale and
+        the measurement is rejected as implausible, falling back to zero.
+        """
+        configured = get_settings().mt5_server_utc_offset_minutes
+        if configured is not None:
+            return timedelta(minutes=int(configured))
+
+        now = datetime.now(UTC)
+        best: float | None = None
+        for symbol in OFFSET_PROBE_SYMBOLS:
+            try:
+                tick = self._mt5.symbol_info_tick(symbol)
+            except Exception:
+                continue
+            if tick is None or not getattr(tick, "time", None):
+                continue
+            delta = (_as_utc(tick.time) - now).total_seconds()
+            if best is None or delta > best:
+                best = delta
+
+        if best is None or abs(best) / 60 > MAX_PLAUSIBLE_OFFSET_MINUTES:
+            log.warning("mt5_server_offset_undetected", measured_seconds=best)
+            return timedelta(0)
+
+        offset = timedelta(minutes=_round_offset_minutes(best))
+        log.info("mt5_server_offset_detected", hours=offset.total_seconds() / 3600)
+        return offset
+
+    def _server_to_utc(self, value) -> datetime:
+        return _as_utc(value) - (self._server_offset or timedelta(0))
+
+    def _utc_to_server(self, value: datetime) -> datetime:
+        aware = value.astimezone(UTC) if value.tzinfo else value.replace(tzinfo=UTC)
+        return aware + (self._server_offset or timedelta(0))
 
     def connect(self) -> MT5Status:
         settings = get_settings()
@@ -78,6 +136,7 @@ class OfficialMT5Connector(MT5Connector):
 
         self._connected = True
         self._error = ""
+        self._server_offset = self._detect_server_offset()
         self._status = MT5Status(
             connected=True,
             mode="official",
@@ -142,6 +201,7 @@ class OfficialMT5Connector(MT5Connector):
         info = self._mt5.symbol_info(requested)
         if info is not None:
             self._mt5.symbol_select(requested, True)
+            self._point_cache[info.name] = float(info.point)
             return SymbolInfo(
                 name=info.name,
                 description=info.description or "",
@@ -161,18 +221,22 @@ class OfficialMT5Connector(MT5Connector):
             match = next((s for s in ranked if s.name.upper() == f"{base}{suffix}".upper()), None)
             if match:
                 self._mt5.symbol_select(match.name, True)
+                self._point_cache[match.name] = float(match.point)
                 return match
         if ranked:
             ranked.sort(key=lambda s: len(s.name))
             self._mt5.symbol_select(ranked[0].name, True)
+            self._point_cache[ranked[0].name] = float(ranked[0].point)
             return ranked[0]
         return None
 
     def copy_rates_range(self, symbol: str, timeframe: str, date_from: datetime, date_to: datetime) -> list[CandleRecord]:
         self._require()
         tf = TIMEFRAME_MT5[timeframe]
-        start = date_from.astimezone(UTC) if date_from.tzinfo else date_from.replace(tzinfo=UTC)
-        end = date_to.astimezone(UTC) if date_to.tzinfo else date_to.replace(tzinfo=UTC)
+        # Bounds must be expressed on the server clock or the newest bars fall
+        # outside the window by the server offset.
+        start = self._utc_to_server(date_from)
+        end = self._utc_to_server(date_to)
         rates = self._mt5.copy_rates_range(symbol, tf, start, end)
         if rates is None:
             raise RuntimeError(f"copy_rates_range failed for {symbol} {timeframe}: {self._mt5.last_error()}")
@@ -195,7 +259,7 @@ class OfficialMT5Connector(MT5Connector):
             return None
         return TickRecord(
             symbol=symbol,
-            timestamp=_as_utc(tick.time),
+            timestamp=self._server_to_utc(tick.time),
             bid=float(tick.bid),
             ask=float(tick.ask),
             last=float(tick.last or tick.bid),
@@ -206,18 +270,30 @@ class OfficialMT5Connector(MT5Connector):
         spread = None
         bid = tick.bid if tick else None
         ask = tick.ask if tick else None
-        if bid is not None and ask is not None:
+        # MT5 rate rows contain the spread observed for that historical bar in
+        # integer symbol points. Never stamp today's tick spread onto history.
+        names = getattr(getattr(row, "dtype", None), "names", None) or ()
+        historical_points = row["spread"] if "spread" in names else None
+        point = self._point_cache.get(symbol)
+        if point is None:
+            info = self._mt5.symbol_info(symbol)
+            point = float(getattr(info, "point", 0) or 0)
+            if point:
+                self._point_cache[symbol] = point
+        if historical_points is not None and point:
+            spread = float(historical_points) * point
+        elif bid is not None and ask is not None:
             spread = ask - bid
         return CandleRecord(
             symbol=symbol,
             timeframe=timeframe,
-            timestamp=_as_utc(row["time"]),
+            timestamp=self._server_to_utc(row["time"]),
             open=float(row["open"]),
             high=float(row["high"]),
             low=float(row["low"]),
             close=float(row["close"]),
             tick_volume=int(row["tick_volume"]),
-            real_volume=int(row["real_volume"]) if "real_volume" in row.dtype.names else 0,
+            real_volume=int(row["real_volume"]) if "real_volume" in names else 0,
             spread=spread,
             bid=bid,
             ask=ask,

@@ -31,6 +31,10 @@ class Settings(BaseSettings):
     mt5_server: str = ""
     mt5_terminal_path: str = ""
     mt5_timeout_ms: int = 60000
+    # Broker server clock offset from UTC in minutes. None auto-detects from a live
+    # tick on connect. Pin it when the market is closed at startup (FBS = 120 in
+    # winter, 180 in summer).
+    mt5_server_utc_offset_minutes: int | None = None
     # macOS Wine bridge (MT5_MODE=bridge). Windows official/agent ignore these.
     mt5_bridge_host: str = "127.0.0.1"
     mt5_bridge_port: int = 18813
@@ -51,6 +55,8 @@ class Settings(BaseSettings):
 
     stale_candle_seconds: int = 180
     large_spread_pips: float = 5.0
+    # Relative width; a BTC $20 spread is ~3 bps and must not trip the FX pip gate.
+    large_spread_bps: float = 8.0
     alert_probability_threshold: float = 0.70
 
     @field_validator("mt5_login", mode="before")

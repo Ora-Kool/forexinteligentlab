@@ -4,6 +4,7 @@ import threading
 from datetime import UTC, datetime
 
 from app.core.config import get_settings
+from app.core.constants import TIMEFRAME_MINUTES
 from app.core.logging import get_logger
 from app.core.tenant import SYSTEM_WORKSPACE_ID, set_workspace_id
 from app.database.session import SessionLocal
@@ -59,13 +60,18 @@ def _loop() -> None:
                 if row.last_candle is None:
                     continue
                 age = (now - row.last_candle.replace(tzinfo=row.last_candle.tzinfo or UTC)).total_seconds()
-                if age > settings.stale_candle_seconds:
+                # The newest bar is the one still forming, so its timestamp is up to
+                # one full bar old on a healthy feed. Grace is added on top of that,
+                # otherwise every timeframe above M5 reads STALE forever.
+                allowed = TIMEFRAME_MINUTES.get(row.timeframe, 5) * 60 + settings.stale_candle_seconds
+                if age > allowed:
                     row.status = "STALE"
                     db.commit()
                     raise_alert(
                         db,
                         "stale_candle",
-                        f"No new candle for {row.symbol} {row.timeframe} in {int(age)}s",
+                        f"No new candle for {row.symbol} {row.timeframe} in {int(age)}s "
+                        f"(allowed {allowed}s)",
                         symbol=row.symbol,
                         timeframe=row.timeframe,
                     )

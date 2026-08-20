@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from sqlalchemy.orm import Session
 
 from app.core.config import get_settings
-from app.core.constants import TIMEFRAME_MINUTES, pip_size_for
+from app.core.constants import TIMEFRAME_MINUTES, spread_is_wide, spread_pips
 from app.core.logging import get_logger
 from app.core.tenant import SYSTEM_WORKSPACE_ID, set_workspace_id
 from app.models.collection import CollectionStatus
@@ -19,6 +19,21 @@ from app.services.predictions import generate_prediction, resolve_outcomes
 from app.services.runtime import runtime
 
 log = get_logger(__name__)
+
+
+def monitored_pairs(db: Session) -> list[tuple[str, str, list[int]]]:
+    """Every enabled symbol/timeframe across all workspaces, deduplicated.
+
+    Candles are shared research data (``market_candles`` has no workspace), so a
+    pair only needs polling once no matter how many workspaces watch it. The
+    workspace ids ride along because predictions *are* workspace scoped and each
+    owner needs its own model scored.
+    """
+    rows = db.query(MonitoredInstrument).filter(MonitoredInstrument.enabled.is_(True)).all()
+    pairs: dict[tuple[str, str], list[int]] = {}
+    for row in rows:
+        pairs.setdefault((row.symbol, row.timeframe), []).append(row.workspace_id)
+    return [(symbol, timeframe, sorted(set(ids))) for (symbol, timeframe), ids in pairs.items()]
 
 
 def _status_row(db: Session, symbol: str, timeframe: str) -> CollectionStatus:
@@ -69,65 +84,84 @@ def collect_once(db: Session, connector: MT5Connector) -> dict:
     runtime.mt5_error = ""
     runtime.mt5_mode = status.mode
 
-    instruments = (
-        db.query(MonitoredInstrument)
-        .filter(
-            MonitoredInstrument.workspace_id == SYSTEM_WORKSPACE_ID,
-            MonitoredInstrument.enabled.is_(True),
-        )
-        .all()
-    )
     results = []
-    for instrument in instruments:
-        row = _status_row(db, instrument.symbol, instrument.timeframe)
+    for symbol, timeframe, workspace_ids in monitored_pairs(db):
+        row = _status_row(db, symbol, timeframe)
         try:
-            resolved = connector.resolve_symbol(instrument.symbol)
+            resolved = connector.resolve_symbol(symbol)
             if resolved is None:
-                raise ValueError(f"Symbol {instrument.symbol} does not exist on this MT5/FBS account")
-            if resolved.name != instrument.symbol:
-                instrument.symbol = resolved.name
+                raise ValueError(f"Symbol {symbol} does not exist on this MT5/FBS account")
+            if resolved.name != symbol:
+                db.query(MonitoredInstrument).filter(
+                    MonitoredInstrument.symbol == symbol,
+                    MonitoredInstrument.timeframe == timeframe,
+                ).update({"symbol": resolved.name})
                 db.commit()
 
-            candles = connector.copy_rates_from_pos(resolved.name, instrument.timeframe, 0, 8)
+            candles = connector.copy_rates_from_pos(resolved.name, timeframe, 0, 8)
             if not candles:
-                raise ValueError(f"No candles returned for {resolved.name} {instrument.timeframe}")
+                raise ValueError(f"No candles returned for {resolved.name} {timeframe}")
             stored = upsert_candles(db, candles)
             latest = candles[-1]
             tick = connector.symbol_tick(resolved.name)
-            persist_latest_features(db, resolved.name, instrument.timeframe)
-            prediction = generate_prediction(db, resolved.name, instrument.timeframe)
-            resolve_outcomes(db, resolved.name, instrument.timeframe)
+            persist_latest_features(db, resolved.name, timeframe)
+
+            # Score once per owning workspace: each one may have its own model.
+            prediction = None
+            for workspace_id in workspace_ids:
+                set_workspace_id(workspace_id)
+                try:
+                    scored = generate_prediction(db, resolved.name, timeframe)
+                    resolve_outcomes(db, resolved.name, timeframe)
+                except Exception as exc:
+                    db.rollback()
+                    log.error(
+                        "score_workspace_failed",
+                        symbol=resolved.name,
+                        timeframe=timeframe,
+                        workspace_id=workspace_id,
+                        error=str(exc),
+                    )
+                    continue
+                if prediction is None:
+                    prediction = scored
+            set_workspace_id(SYSTEM_WORKSPACE_ID)
 
             row.last_candle = latest.timestamp
-            row.candles_collected = candle_count(db, resolved.name, instrument.timeframe)
+            row.candles_collected = candle_count(db, resolved.name, timeframe)
             row.status = "LIVE"
             row.last_error = ""
             row.updated_at = datetime.now(UTC)
             db.commit()
 
             runtime.last_data_at = datetime.now(UTC)
-            spread_pips = None
-            if latest.spread is not None:
-                spread_pips = latest.spread / pip_size_for(resolved.name)
+            spread_value = latest.spread
             if tick and tick.ask and tick.bid:
-                spread_pips = (tick.ask - tick.bid) / pip_size_for(resolved.name)
-            if spread_pips is not None and spread_pips >= settings.large_spread_pips:
+                spread_value = tick.ask - tick.bid
+            spread_pips_value = spread_pips(spread_value, resolved.name)
+            if spread_is_wide(
+                spread=spread_value,
+                price=latest.close,
+                symbol=resolved.name,
+                pip_threshold=settings.large_spread_pips,
+                bps_threshold=settings.large_spread_bps,
+            ):
                 raise_alert(
                     db,
                     "large_spread",
-                    f"{resolved.name} spread {spread_pips:.1f} pips exceeds threshold",
+                    f"{resolved.name} spread {spread_pips_value:.1f} pips exceeds threshold",
                     symbol=resolved.name,
-                    timeframe=instrument.timeframe,
+                    timeframe=timeframe,
                 )
 
             card = {
                 "symbol": resolved.name,
-                "timeframe": instrument.timeframe,
+                "timeframe": timeframe,
                 "price": latest.close,
                 "bid": tick.bid if tick else latest.bid,
                 "ask": tick.ask if tick else latest.ask,
                 "spread": latest.spread,
-                "spread_pips": spread_pips,
+                "spread_pips": spread_pips_value,
                 "timestamp": latest.timestamp,
                 "status": "LIVE",
                 "prediction": None
@@ -140,7 +174,7 @@ def collect_once(db: Session, connector: MT5Connector) -> dict:
                     "timestamp": prediction.timestamp,
                 },
             }
-            runtime.last_tick[f"{resolved.name}:{instrument.timeframe}"] = card
+            runtime.last_tick[f"{resolved.name}:{timeframe}"] = card
             hub.publish("market", {"type": "candle", **card})
             if prediction is not None:
                 hub.publish(
@@ -148,7 +182,7 @@ def collect_once(db: Session, connector: MT5Connector) -> dict:
                     {
                         "type": "prediction",
                         "symbol": resolved.name,
-                        "timeframe": instrument.timeframe,
+                        "timeframe": timeframe,
                         "probability_up": prediction.probability_up,
                         "probability_down": prediction.probability_down,
                         "prediction": prediction.prediction,
@@ -160,13 +194,15 @@ def collect_once(db: Session, connector: MT5Connector) -> dict:
                 )
             results.append({"symbol": resolved.name, "inserted": stored["inserted"], "duplicates": stored["duplicates"]})
         except Exception as exc:
-            log.error("collect_symbol_failed", symbol=instrument.symbol, error=str(exc))
+            set_workspace_id(SYSTEM_WORKSPACE_ID)
+            db.rollback()
+            log.error("collect_symbol_failed", symbol=symbol, timeframe=timeframe, error=str(exc))
             row.status = "ERROR"
             row.last_error = str(exc)
             row.updated_at = datetime.now(UTC)
             db.commit()
-            record_event(db, "error", "collector", f"{instrument.symbol}: {exc}", {"symbol": instrument.symbol})
-            results.append({"symbol": instrument.symbol, "error": str(exc)})
+            record_event(db, "error", "collector", f"{symbol} {timeframe}: {exc}", {"symbol": symbol})
+            results.append({"symbol": symbol, "timeframe": timeframe, "error": str(exc)})
 
     hub.publish("collector", {"type": "status", **runtime.snapshot(), "results": results})
     return {"ok": True, "results": results}

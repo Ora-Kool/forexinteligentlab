@@ -28,6 +28,7 @@ Companion desk UI (Laravel): [Ora-Kool/forex-trading-lab-dashboard](https://gith
 
 Day-to-day ops cheat sheet: **[docs/OPS.md](docs/OPS.md)**  
 Mac Wine bridge details: **[docs/MT5_MAC_BRIDGE.md](docs/MT5_MAC_BRIDGE.md)**
+Cost-aware experiment methodology: **[docs/RESEARCH.md](docs/RESEARCH.md)**
 
 ---
 

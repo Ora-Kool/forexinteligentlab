@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from app.ml.predict import predict_from_candles
 from app.ml.targets import chronological_split, build_training_table
 from app.ml.train import train_logistic_regression
@@ -31,6 +33,29 @@ def test_chronological_split_does_not_shuffle():
     table = build_training_table(_trend(120))
     train, test = chronological_split(table, 0.2)
     assert train["timestamp"].iloc[-1] <= test["timestamp"].iloc[0]
+
+
+def test_build_training_table_handles_no_candles():
+    # A timeframe with no imported history used to raise KeyError('timestamp').
+    assert build_training_table([]).empty
+
+
+def test_training_table_does_not_label_the_unresolved_final_candle():
+    candles = _trend(120)
+    table = build_training_table(candles)
+    assert table["timestamp"].max().to_pydatetime() < candles[-1]["timestamp"]
+
+
+def test_training_untouched_timeframe_reports_missing_history():
+    with pytest.raises(ValueError, match="Not enough H4 history for EURUSD"):
+        train_logistic_regression(
+            [],
+            symbol="EURUSD",
+            timeframe="H4",
+            spread_cost_pips=0.8,
+            transaction_cost_pips=0.2,
+            pip_size=0.0001,
+        )
 
 
 def test_model_training_and_prediction(tmp_path, monkeypatch):
